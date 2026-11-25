@@ -108,6 +108,21 @@ class mvtec_dataset(Dataset):
         self.preprocess.transforms[1] = transforms.CenterCrop(size=(240, 240))
         self.dataset_init()
         self.resize_shape = (spatial_size, spatial_size)
+        self.reference_paths = []
+        if self.shot:
+            if self.shot < 0:
+                raise ValueError(f"shot must be non-negative, got {self.shot}")
+            reference_dir = os.path.join(self.data_dir, self.obj_type, 'train', 'good')
+            available_references = sorted(glob.glob(os.path.join(reference_dir, '*.*')))
+            if self.shot > len(available_references):
+                raise ValueError(
+                    f"Requested {self.shot} reference images for {self.obj_type}, "
+                    f"but only {len(available_references)} are available in {reference_dir}"
+                )
+            selected = np.random.RandomState(10).choice(
+                len(available_references), self.shot, replace=False
+            )
+            self.reference_paths = [available_references[i] for i in selected]
         
 
     def dataset_init(self):
@@ -176,17 +191,7 @@ class mvtec_dataset(Dataset):
                 defect_type: 3
                 dice: 10
         """
-        normal_list = []
-
-        if self.shot != 0:
-            type_dir = os.path.join(self.data_dir, self.obj_type)
-            img_dir = os.path.join(type_dir, 'train', 'good')
-            all_ref_file = os.listdir(os.path.join(img_dir))
-            m = np.random.RandomState(10).choice(all_ref_file, self.shot)
-
-            for file in m:
-                tmp_dir = os.path.join(img_dir, file)
-                normal_list.append(tmp_dir)
+        normal_list = self.reference_paths
 
         img_path = self.img_paths[indice]
 

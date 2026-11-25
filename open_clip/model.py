@@ -502,71 +502,50 @@ class WinCLIP(nn.Module):
         return anomaly_map
 
     def forward(self,image: Optional[torch.Tensor] = None):
-        device = torch.cuda.current_device()
-        img = image[0]
-        img_n1 = image[1]
-        img_n2 = image[2]
-        img_n3 = image[3]
-        img_n4 = image[4]
-        # img_n5 = image[5]
-        # img_n6 = image[6]
-        # img_n7 = image[7]
-        # img_n8 = image[8]
-        window_mask1 = self.window_masks.mask_generate(kernel_size=32, patch_size=16).squeeze().cuda()
-        window_mask2 = self.window_masks.mask_generate(kernel_size=48, patch_size=16).squeeze().cuda()
+        if not isinstance(image, (list, tuple)) or len(image) < 2:
+            raise ValueError("Few-shot WinCLIP expects [query_image, ref_image_1, ...]")
+
+        device = next(self.parameters()).device
+        query_images = image[0]
+        reference_images = image[1:]
+        window_mask1 = self.window_masks.mask_generate(kernel_size=32, patch_size=16).squeeze().to(device)
+        window_mask2 = self.window_masks.mask_generate(kernel_size=48, patch_size=16).squeeze().to(device)
         window_masks = [window_mask1, window_mask2]
 
-        if isinstance(img, list):
-            pred = []
-            for i in range(len(img)):
-                image = img[i].cuda(device=device)
-                normal_img = []
-                n1 = img_n1[i].cuda(device=device)
-                n2 = img_n2[i].cuda(device=device)
-                n3 = img_n3[i].cuda(device=device)
-                n4 = img_n4[i].cuda(device=device)
-                # n5 = img_n5[i].cuda(device=device)
-                # n6 = img_n6[i].cuda(device=device)
-                # n7 = img_n7[i].cuda(device=device)
-                # n8 = img_n8[i].cuda(device=device)
-                normal_img.append(n1)
-                normal_img.append(n2)
-                normal_img.append(n3)
-                normal_img.append(n4)
-                # normal_img.append(n5)
-                # normal_img.append(n6)
-                # normal_img.append(n7)
-                # normal_img.append(n8)
-                normal_img = torch.stack(normal_img)
-                normal_img = normal_img.squeeze(1)
-                F_w, F_p, _ = self.encode_image(image, window_masks=window_masks)
-                self.build_image_feature_gallery(normal_img, window_masks)
-                visual_anomaly_map = self.calculate_visual_anomaly_score(F_w, F_p)
-                anomaly_map = visual_anomaly_map.float()
-                am_np = anomaly_map.squeeze(1).cpu().numpy()
-                score = np.max(am_np)
-                pred.append(score)
-            score = sum(pred)/len(pred)
-        else:
-            img = img.cuda(device=device)
-            normal_img = []
-            normal_img.append(img_n1.cuda(device=device))
-            normal_img.append(img_n2.cuda(device=device))
-            normal_img.append(img_n3.cuda(device=device))
-            normal_img.append(img_n4.cuda(device=device))
-            # normal_img.append(img_n5.cuda(device=device))
-            # normal_img.append(img_n6.cuda(device=device))
-            # normal_img.append(img_n7.cuda(device=device))
-            # normal_img.append(img_n8.cuda(device=device))
-            normal_img = torch.stack(normal_img)
-            normal_img = normal_img.squeeze(1)
-            F_w, F_p, _= self.encode_image(img, window_masks=window_masks)
-            self.build_image_feature_gallery(normal_img, window_masks)
-            visual_anomaly_map = self.calculate_visual_anomaly_score(F_w, F_p)
-            anomaly_map = visual_anomaly_map.float()
-            am_np = anomaly_map.squeeze(1).cpu().numpy()
-            score = np.max(am_np)
-        return score
+        # A square image is a tensor; tiled images are lists of tensors. The
+        # DataLoader adds a leading batch dimension to each tensor in either case.
+        query_tiles = query_images if isinstance(query_images, (list, tuple)) else [query_images]
+        reference_tiles = []
+        for reference in reference_images:
+            if isinstance(reference, (list, tuple)):
+                reference_tiles.append(reference)
+            else:
+                reference_tiles.append([reference])
+
+        scores = []
+        for tile_index, query in enumerate(query_tiles):
+            query = query.to(device)
+            if query.ndim == 3:
+                query = query.unsqueeze(0)
+
+            normal_images = []
+            for reference in reference_tiles:
+                if tile_index >= len(reference):
+                    raise ValueError(
+                        "Query and few-shot reference images have different tile counts"
+                    )
+                normal = reference[tile_index].to(device)
+                if normal.ndim == 3:
+                    normal = normal.unsqueeze(0)
+                normal_images.append(normal)
+            normal_images = torch.cat(normal_images, dim=0)
+
+            F_w, F_p, _ = self.encode_image(query, window_masks=window_masks)
+            self.build_image_feature_gallery(normal_images, window_masks)
+            anomaly_map = self.calculate_visual_anomaly_score(F_w, F_p).float()
+            scores.append(float(anomaly_map.squeeze(1).max().cpu()))
+
+        return float(np.mean(scores))
 
 class CustomTextCLIP(nn.Module):
     output_dict: torch.jit.Final[bool]
