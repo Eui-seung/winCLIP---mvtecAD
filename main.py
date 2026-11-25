@@ -56,8 +56,8 @@ def get_texts(obj_name):
 
     return normal_texts, anomaly_texts
 
-def run(config):
-    # load model, preprocessor and tokenizer
+def load_model():
+    # Construct the model and load its checkpoint once for the full evaluation.
     device = torch.cuda.current_device()
     tokenizer = open_clip.get_tokenizer('ViT-B-16-plus-240')
     _, _, preprocess = open_clip.create_model_and_transforms('ViT-B-16-plus-240')
@@ -72,86 +72,92 @@ def run(config):
     quick_gelu = False
 
     model = open_clip.model.WinCLIP(embed_dim, vision_cfg, text_cfg, quick_gelu, cast_dtype=cast_dtype)
-    model = model.cuda(device=device)
 
     with pathmgr.open("./vit_b_16_plus_240-laion400m_e31-8fb26589.pt", "rb") as f:
         checkpoint = torch.load(f, map_location="cpu")
 
     model.load_state_dict(checkpoint, strict=False)
+    model = model.cuda(device=device)
+    model.eval()
+    del checkpoint
+    return model, tokenizer, preprocess, device
+
+
+def run(config, model, tokenizer, preprocess, device):
 
     # load dataset
     obj_type = config['obj_type']
     shot = config["shot"]
-    dataset = mvtec_dataset(config, config["data_dir"], mode='test', shot=shot, preprocess=preprocess)
+    dataset = mvtec_dataset(
+        config, config["data_dir"], mode='test', shot=shot,
+        preprocess=preprocess, return_references=False,
+    )
     dataloader = DataLoader(dataset=dataset, batch_size=1, num_workers=8, shuffle=False)
+
+    if shot > 0:
+        reference_images = torch.stack(dataset.reference_images).to(device)
+        model.build_image_feature_gallery(reference_images)
 
     # load text template
     normal_texts, anomaly_texts = get_texts(obj_type.replace('_', " "))
+    pos_features = tokenizer(normal_texts).to(device)
+    neg_features = tokenizer(anomaly_texts).to(device)
+    with torch.no_grad():
+        pos_features = model.encode_text(pos_features)
+        neg_features = model.encode_text(neg_features)
+        pos_features = pos_features / pos_features.norm(dim=-1, keepdim=True)
+        neg_features = neg_features / neg_features.norm(dim=-1, keepdim=True)
+        pos_features = pos_features.mean(dim=0, keepdim=True)
+        neg_features = neg_features.mean(dim=0, keepdim=True)
+        text_features = torch.cat([pos_features, neg_features], dim=0)
+        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
 
     score_list = []
     gt_list = []
     for data in tqdm(dataloader, desc="Eval: ", total=len(dataloader)):
         image, ref_list, mask, has_anomaly, indice = data
 
-        pos_features = tokenizer(normal_texts).cuda(device=device)
-        neg_features = tokenizer(anomaly_texts).cuda(device=device)
-        pos_features = model.encode_text(pos_features)
-        neg_features = model.encode_text(neg_features)
-        pos_features /= pos_features.norm(dim=-1, keepdim=True)
-        neg_features /= neg_features.norm(dim=-1, keepdim=True)
-        pos_features = torch.mean(pos_features, dim=0, keepdim=True)
-        neg_features = torch.mean(neg_features, dim=0, keepdim=True)
-        pos_features /= pos_features.norm(dim=-1, keepdim=True)
-        neg_features /= neg_features.norm(dim=-1, keepdim=True)
-        text_features = torch.cat([pos_features, neg_features], dim=0)
-
         if isinstance(image, list):
             pred = []
             for i in range(len(image)):
-                img = image[i]
-                img = img.cuda(device=device)
+                img = image[i].to(device)
                 _, _, image_features = model.encode_image(img)
-                image_features /= image_features.norm(dim=-1, keepdim=True)
+                image_features = image_features / image_features.norm(dim=-1, keepdim=True)
                 score = (100.0 * image_features @ text_features.T).softmax(dim=-1)
-                score = score[0, 1].cpu().numpy()
-                pred.append(score)
+                pred.append(float(score[0, 1].cpu()))
             text_probs = sum(pred) / len(pred)
         else:
-            image = image.cuda(device=device)
+            image = image.to(device)
             _, _, image_features = model.encode_image(image)
 
-            image_features /= image_features.norm(dim=-1, keepdim=True)
-            text_features /= text_features.norm(dim=-1, keepdim=True)
+            image_features = image_features / image_features.norm(dim=-1, keepdim=True)
 
             text_probs = (100.0 * image_features @ text_features.T).softmax(dim=-1)
-            text_probs = text_probs[0, 1].cpu().numpy()
+            text_probs = float(text_probs[0, 1].cpu())
 
         if shot == 0:
             # zero-shot classification score
             score = text_probs
             score_list.append(score)
-            gt_list.append(has_anomaly[0].numpy())
+            gt_list.append(float(has_anomaly[0]))
         else:
             # few-shot classification score
-            img = []
-            img.append(image)
-            for i in ref_list:
-                img.append(i)
-
-            vis_probs = model.forward(image=img)
+            vis_probs = model(image=image)
             score = (vis_probs + text_probs)/2
             if math.isinf(score):
                 score = float(0)
-            score_list.append(score)
-            gt_list.append(has_anomaly[0].numpy())
+            score_list.append(float(score))
+            gt_list.append(float(has_anomaly[0]))
 
-    auroc = roc_auc_score(gt_list, score_list)
-    precision, recall, _ = precision_recall_curve(gt_list, score_list)
+    gt_array = np.asarray(gt_list)
+    score_array = np.asarray(score_list)
+    auroc = roc_auc_score(gt_array, score_array)
+    precision, recall, _ = precision_recall_curve(gt_array, score_array)
     aupr = auc(recall, precision)
     f1_max = 0
     for threshold in np.arange(0, 1, 0.01):
-        y_pred = (score_list > threshold).astype(int)
-        f1 = f1_score(gt_list, y_pred)
+        y_pred = (score_array > threshold).astype(int)
+        f1 = f1_score(gt_array, y_pred)
         if f1 > f1_max:
             f1_max = f1
 
@@ -173,10 +179,13 @@ if __name__ == "__main__":
     all_f1_list = []
     all_gt_list = []
     all_score_list = []
+    model, tokenizer, preprocess, device = load_model()
     with torch.no_grad(), torch.cuda.amp.autocast():
         for obj_type in OBJECT_TYPE:
             config['obj_type'] = obj_type
-            gt_list, score_list, auroc, aupr, f1_max = run(config)
+            gt_list, score_list, auroc, aupr, f1_max = run(
+                config, model, tokenizer, preprocess, device
+            )
             all_auroc_list.append(auroc)
             all_aupr_list.append(aupr)
             all_f1_list.append(f1_max)
@@ -187,13 +196,15 @@ if __name__ == "__main__":
     print('Avg aupr: {}'.format(np.mean(all_aupr_list)))
     print('Avg f1-max: {}'.format(np.mean(all_f1_list)))
 
-    auroc = roc_auc_score(all_gt_list, all_score_list)
-    precision, recall, _ = precision_recall_curve(all_gt_list, all_score_list)
+    all_gt_array = np.asarray(all_gt_list)
+    all_score_array = np.asarray(all_score_list)
+    auroc = roc_auc_score(all_gt_array, all_score_array)
+    precision, recall, _ = precision_recall_curve(all_gt_array, all_score_array)
     aupr = auc(recall, precision)
     f1_max = 0
     for threshold in np.arange(0, 1, 0.01):
-        y_pred = (all_score_list > threshold).astype(int)
-        f1 = f1_score(all_gt_list, y_pred)
+        y_pred = (all_score_array > threshold).astype(int)
+        f1 = f1_score(all_gt_array, y_pred)
         if f1 > f1_max:
             f1_max = f1
     print("All Type: AUROC={}, AUPR={}, F1-Max={}".format(auroc, aupr, f1_max))

@@ -81,7 +81,8 @@ def _convert_to_rgb(image):
     return image.convert('RGB')
 
 class mvtec_dataset(Dataset):
-    def __init__(self, config, data_dir, spatial_size=240, mode="train", shot=0, preprocess=None):
+    def __init__(self, config, data_dir, spatial_size=240, mode="train", shot=0,
+                 preprocess=None, return_references=True):
         super(mvtec_dataset, self).__init__()
         self.shot = shot
         self.data_dir = data_dir
@@ -102,6 +103,7 @@ class mvtec_dataset(Dataset):
         self.obj_type = config['obj_type']
         self.mode = mode
         self.preprocess = preprocess
+        self.return_references = return_references
         self.preprocess.transforms[0] = transforms.Resize(size=(240, 240),
                                                      interpolation=transforms.InterpolationMode.BICUBIC,
                                                      max_size=None, antialias=None)
@@ -123,6 +125,10 @@ class mvtec_dataset(Dataset):
                 len(available_references), self.shot, replace=False
             )
             self.reference_paths = [available_references[i] for i in selected]
+        transform = self.preprocess if self.preprocess is not None else self.pre_transform
+        self.reference_images = [
+            self.transform_image(path, transform) for path in self.reference_paths
+        ]
         
 
     def dataset_init(self):
@@ -191,7 +197,7 @@ class mvtec_dataset(Dataset):
                 defect_type: 3
                 dice: 10
         """
-        normal_list = self.reference_paths
+        normal_list = self.reference_images if self.return_references else []
 
         img_path = self.img_paths[indice]
 
@@ -212,16 +218,9 @@ class mvtec_dataset(Dataset):
         
         if self.preprocess is not None:
             image = self.transform_image(img_path, self.preprocess)
-            ref_list = []
-            for i in normal_list:
-                ref = self.transform_image(i, self.preprocess)
-                ref_list.append(ref)
         else:
             image = self.transform_image(img_path, self.pre_transform)
-            ref_list = []
-            for i in normal_list:
-                ref = self.transform_image(i, self.pre_transform)
-                ref_list.append(ref)
+        ref_list = normal_list
 
 
         mask = self.resize(mask)

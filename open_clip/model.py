@@ -384,6 +384,10 @@ class WinCLIP(nn.Module):
         self.grid_size = self.visual.grid_size
         self.precision = 'fp16'
         self.window_masks = window_masking((240, 240))
+        self._cached_window_masks = None
+        self.visual_gallery1 = None
+        self.visual_gallery2 = None
+        self.fps = None
 
         for p in self.visual.parameters():
             p.requires_grad = False
@@ -409,17 +413,27 @@ class WinCLIP(nn.Module):
         x = x[torch.arange(x.shape[0]), text.argmax(dim=-1)] @ self.text_projection
         return F.normalize(x, dim=-1) if normalize else x
 
-    def build_image_feature_gallery(self, normal_images, mask):
-        self.visual_gallery1 = []
-        self.visual_gallery2 = []
-        _, F_p_n, _ = self.encode_image(normal_images, window_masks=mask)
+    def get_window_masks(self, device):
+        if self._cached_window_masks is None:
+            self._cached_window_masks = [
+                self.window_masks.mask_generate(kernel_size=32, patch_size=16).squeeze().to(device),
+                self.window_masks.mask_generate(kernel_size=48, patch_size=16).squeeze().to(device),
+            ]
+        return self._cached_window_masks
 
-        for i in normal_images:
-            i = i.unsqueeze(0)
-            visual_feature_i, F_p_i, _ = self.encode_image(i, window_masks=mask)
-            self.visual_gallery1.append(visual_feature_i[0])
-            self.visual_gallery2.append(visual_feature_i[1])
-        self.fps = F_p_n
+    def build_image_feature_gallery(self, normal_images, mask=None):
+        if normal_images.ndim == 3:
+            normal_images = normal_images.unsqueeze(0)
+        if normal_images.shape[0] == 0:
+            raise ValueError("At least one normal reference image is required")
+        device = next(self.parameters()).device
+        mask = mask or self.get_window_masks(device)
+
+        # Encode the references as one batch. The original implementation encoded
+        # the whole batch for patch features, then encoded every image again.
+        visual_features, self.fps, _ = self.encode_image(normal_images, window_masks=mask)
+        self.visual_gallery1 = [visual_features[0][i:i + 1] for i in range(normal_images.shape[0])]
+        self.visual_gallery2 = [visual_features[1][i:i + 1] for i in range(normal_images.shape[0])]
 
     def calculate_visual_anomaly_score(self, visual_features, F_p):
         feature1, feature2 = visual_features[0], visual_features[1]
@@ -435,8 +449,8 @@ class WinCLIP(nn.Module):
 
         feature1 = feature1.squeeze(2)
         feature2 = feature2.squeeze(2)
-        visual_gallery1 = visual_gallery1.squeeze()
-        visual_gallery2 = visual_gallery2.squeeze()
+        visual_gallery1 = visual_gallery1.squeeze().clone()
+        visual_gallery2 = visual_gallery2.squeeze().clone()
 
         score_map1 = list()
         for i in range(len(feature1)):
@@ -460,11 +474,11 @@ class WinCLIP(nn.Module):
             score_map2.append(tmp)
         score_map2 = torch.stack(score_map2)
 
-        self.fps = self.fps.reshape(-1, 896)
+        fps = self.fps.reshape(-1, 896).clone()
         F_p = F_p.permute(1, 0, 2)
         score_map3 = []
         for i in range(len(F_p)):
-            tmp_fps = self.fps
+            tmp_fps = fps
             tmp_fp = F_p[i, :, :]
             tmp_fps /= tmp_fps.norm(dim=-1, keepdim=True)
             tmp_fp /= tmp_fp.norm(dim=-1, keepdim=True)
@@ -473,8 +487,7 @@ class WinCLIP(nn.Module):
             score_map3.append(s)
         score_map3 = torch.stack(score_map3)
 
-        window_mask1 = self.window_masks.mask_generate(kernel_size=32, patch_size=16).squeeze().cuda()
-        window_mask2 = self.window_masks.mask_generate(kernel_size=48, patch_size=16).squeeze().cuda()
+        window_mask1, window_mask2 = self.get_window_masks(score_map1.device)
 
         score_map1 = score_map1.double()
         score1 = torch.zeros((1, 225)).to(score_map1).double()
@@ -502,25 +515,14 @@ class WinCLIP(nn.Module):
         return anomaly_map
 
     def forward(self,image: Optional[torch.Tensor] = None):
-        if not isinstance(image, (list, tuple)) or len(image) < 2:
-            raise ValueError("Few-shot WinCLIP expects [query_image, ref_image_1, ...]")
-
+        if self.visual_gallery1 is None or self.visual_gallery2 is None or self.fps is None:
+            raise RuntimeError("Build the few-shot reference gallery before calling forward")
         device = next(self.parameters()).device
-        query_images = image[0]
-        reference_images = image[1:]
-        window_mask1 = self.window_masks.mask_generate(kernel_size=32, patch_size=16).squeeze().to(device)
-        window_mask2 = self.window_masks.mask_generate(kernel_size=48, patch_size=16).squeeze().to(device)
-        window_masks = [window_mask1, window_mask2]
+        window_masks = self.get_window_masks(device)
 
         # A square image is a tensor; tiled images are lists of tensors. The
         # DataLoader adds a leading batch dimension to each tensor in either case.
-        query_tiles = query_images if isinstance(query_images, (list, tuple)) else [query_images]
-        reference_tiles = []
-        for reference in reference_images:
-            if isinstance(reference, (list, tuple)):
-                reference_tiles.append(reference)
-            else:
-                reference_tiles.append([reference])
+        query_tiles = image if isinstance(image, (list, tuple)) else [image]
 
         scores = []
         for tile_index, query in enumerate(query_tiles):
@@ -528,20 +530,7 @@ class WinCLIP(nn.Module):
             if query.ndim == 3:
                 query = query.unsqueeze(0)
 
-            normal_images = []
-            for reference in reference_tiles:
-                if tile_index >= len(reference):
-                    raise ValueError(
-                        "Query and few-shot reference images have different tile counts"
-                    )
-                normal = reference[tile_index].to(device)
-                if normal.ndim == 3:
-                    normal = normal.unsqueeze(0)
-                normal_images.append(normal)
-            normal_images = torch.cat(normal_images, dim=0)
-
             F_w, F_p, _ = self.encode_image(query, window_masks=window_masks)
-            self.build_image_feature_gallery(normal_images, window_masks)
             anomaly_map = self.calculate_visual_anomaly_score(F_w, F_p).float()
             scores.append(float(anomaly_map.squeeze(1).max().cpu()))
 
