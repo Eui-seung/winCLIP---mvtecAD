@@ -22,19 +22,22 @@ import torch.multiprocessing
 torch.multiprocessing.set_sharing_strategy('file_system')
 
 OBJECT_TYPE = [
-"candle",
-"capsules",
-"cashew",
-"chewinggum",
-"fryum",
-"macaroni1",
-"macaroni2",
-"pcb1",
-"pcb2",
-"pcb3",
-"pcb4",
-"pipe_fryum",
-'all']
+    "bottle",
+    "cable",
+    "capsule",
+    "carpet",
+    "grid",
+    "hazelnut",
+    "leather",
+    "metal_nut",
+    "pill",
+    "screw",
+    "tile",
+    "toothbrush",
+    "transistor",
+    "wood",
+    "zipper",
+]
 
 def get_inputs(file_addr, read_flag=None):
     file_format = file_addr.split('.')[-1]
@@ -108,14 +111,11 @@ class mvtec_dataset(Dataset):
         
 
     def dataset_init(self):
-        if self.shot == 'zero':
-            self.img_paths = []
-            return
         if self.obj_type == 'all':
             if self.mode == 'train':
-                self.img_paths = glob.glob(os.path.join(self.data_dir, '**', 'train', 'good', '*.*'))
+                self.img_paths = glob.glob(os.path.join(self.data_dir, '*', 'train', 'good', '*.*'))
             else:
-                self.img_paths = glob.glob(os.path.join(self.data_dir, '**', 'test', '**', '*.*'))
+                self.img_paths = glob.glob(os.path.join(self.data_dir, '*', 'test', '**', '*.*'))
         else:
             type_dir = os.path.join(self.data_dir, self.obj_type)
             if self.mode == 'train':

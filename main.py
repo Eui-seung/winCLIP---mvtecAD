@@ -15,8 +15,6 @@ import sys
 import os
 import math
 
-os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-os.environ['CUDA_VISIBLE_DEVICES'] = "1"
 from datasets.mvtec_dataset import mvtec_dataset, OBJECT_TYPE
 
 state_level = {
@@ -162,16 +160,13 @@ def run(config):
 if __name__ == "__main__":
     np.random.seed(10)
     torch.manual_seed(10)
-    dataset_root_dir = '/home/zhujiawen/PDA/data/visa_anomaly_detection'
-    datasetname = "visa"
-    obj_type_id = 0
+    dataset_root_dir = "/kaggle/input/datasets/ipythonx"
+    datasetname = "mvtec-ad"
     config = {
         'datasetname': datasetname,
         'dataset_root_dir': dataset_root_dir,
         'data_dir': os.path.join(dataset_root_dir, datasetname),
-        'obj_type_id': obj_type_id,
-        'obj_type': OBJECT_TYPE[obj_type_id],
-        'shot': 2,
+        'shot': 0,
     }
     all_auroc_list = []
     all_aupr_list = []
@@ -179,7 +174,7 @@ if __name__ == "__main__":
     all_gt_list = []
     all_score_list = []
     with torch.no_grad(), torch.cuda.amp.autocast():
-        for obj_type in OBJECT_TYPE[:-1]:
+        for obj_type in OBJECT_TYPE:
             config['obj_type'] = obj_type
             gt_list, score_list, auroc, aupr, f1_max = run(config)
             all_auroc_list.append(auroc)
