@@ -429,11 +429,22 @@ class WinCLIP(nn.Module):
         device = next(self.parameters()).device
         mask = mask or self.get_window_masks(device)
 
-        # Encode the references as one batch. The original implementation encoded
-        # the whole batch for patch features, then encoded every image again.
-        visual_features, self.fps, _ = self.encode_image(normal_images, window_masks=mask)
-        self.visual_gallery1 = [visual_features[0][i:i + 1] for i in range(normal_images.shape[0])]
-        self.visual_gallery2 = [visual_features[1][i:i + 1] for i in range(normal_images.shape[0])]
+        # WindowVisionTransformer flattens windows across the input batch, so
+        # its window features cannot be split back into per-image entries when
+        # multiple references are encoded together. Encode each reference on
+        # its own, then concatenate the patch features to retain every shot.
+        self.visual_gallery1 = []
+        self.visual_gallery2 = []
+        patch_features = []
+        for reference in normal_images:
+            visual_features, reference_fps, _ = self.encode_image(
+                reference.unsqueeze(0).to(device), window_masks=mask
+            )
+            self.visual_gallery1.append(visual_features[0])
+            self.visual_gallery2.append(visual_features[1])
+            patch_features.append(reference_fps)
+
+        self.fps = torch.cat(patch_features, dim=0)
 
     def calculate_visual_anomaly_score(self, visual_features, F_p):
         feature1, feature2 = visual_features[0], visual_features[1]
